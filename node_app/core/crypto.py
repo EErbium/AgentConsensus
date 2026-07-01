@@ -2,10 +2,11 @@ import hashlib
 import json
 import binascii
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
     Ed25519PublicKey,
 )
 from cryptography.exceptions import InvalidSignature
-from ..schemas.transaction import TransactionEnvelope
+from node_app.schemas.transaction import TransactionEnvelope
 
 
 def compute_tx_id(
@@ -52,3 +53,10 @@ def verify_envelope_signatures(
         elif not verify_signature(pub_hex, msg, sig_hex):
             failed.append(signer_alias)
     return failed
+
+
+def sign_payload(private_key_hex: str, message: bytes) -> str:
+    sk = Ed25519PrivateKey.from_private_bytes(
+        binascii.unhexlify(private_key_hex)
+    )
+    return binascii.hexlify(sk.sign(message)).decode()

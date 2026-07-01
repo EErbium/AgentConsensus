@@ -16,26 +16,13 @@ KEYS_PATH = os.path.abspath("keys.json")
 
 
 def get_client():
-    try:
-        return docker.from_env()
-    except docker.errors.DockerException as e:
-        print(f"Error connecting to Docker: {e}", file=sys.stderr)
-        sys.exit(1)
+    return docker.from_env()
 
 
 def generate_topology(num_nodes: int):
-    try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PrivateKey,
-        )
-    except ImportError:
-        print(
-            "Missing 'cryptography' package.  Install it with:\n"
-            "  pip install cryptography",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
     print(f"Generating {num_nodes} Ed25519 key pairs ...")
     nodes_pub: dict[str, dict[str, str]] = {}
     private_keys: dict[str, str] = {}

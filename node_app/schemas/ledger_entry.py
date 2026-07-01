@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 from pydantic import BaseModel
-from .transaction import TransactionEnvelope
+from node_app.schemas.transaction import TransactionEnvelope
 
 
 class LedgerEntry(BaseModel):

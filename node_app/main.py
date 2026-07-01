@@ -6,10 +6,12 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from .schemas.transaction import TransactionEnvelope
-from .schemas.ledger_entry import LedgerEntry
-from .core.invariants import InvariantViolation, validate_all
-from .core.crypto import verify_envelope_signatures
+from node_app.schemas.transaction import TransactionEnvelope
+from node_app.schemas.ledger_entry import LedgerEntry
+from node_app.core.invariants import InvariantViolation, validate_all
+from node_app.core.crypto import verify_envelope_signatures
+from node_app.core.consensus_tracker import ConsensusTracker
+from node_app.routers.consensus import router as consensus_router
 
 NODE_ID = os.environ["NODE_ID"]
 PRIVATE_KEY_HEX = os.environ["PRIVATE_KEY_HEX"]
@@ -22,6 +24,8 @@ PUBLIC_KEYS: dict[str, str] = {
     name: info["public_key"] for name, info in topology["nodes"].items()
 }
 
+PEERS = [name for name in PUBLIC_KEYS if name != NODE_ID]
+
 STORAGE_DIR = Path(__file__).parent / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
 LEDGER_PATH = STORAGE_DIR / "ledger.json"
@@ -31,6 +35,16 @@ if not LEDGER_PATH.exists():
 lock = asyncio.Lock()
 
 app = FastAPI(title=f"AgentConsensus - {NODE_ID}")
+
+app.state.node_id = NODE_ID
+app.state.private_key_hex = PRIVATE_KEY_HEX
+app.state.public_keys = PUBLIC_KEYS
+app.state.peers = PEERS
+app.state.tracker = ConsensusTracker(n=len(PUBLIC_KEYS))
+app.state.ledger_lock = lock
+app.state.ledger_path = LEDGER_PATH
+
+app.include_router(consensus_router)
 
 
 @app.get("/health")

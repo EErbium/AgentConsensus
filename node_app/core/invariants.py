@@ -1,5 +1,5 @@
 import time
-from ..schemas.transaction import ExecutionPayload
+from node_app.schemas.transaction import ExecutionPayload
 
 MAX_ALLOCATE_AMOUNT = 1000.00000000
 MAX_TIMESTAMP_DRIFT_SECONDS = 60
