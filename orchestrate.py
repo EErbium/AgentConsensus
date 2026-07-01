@@ -3,6 +3,7 @@ import json
 import os
 import binascii
 import sys
+sys.stdout.reconfigure(encoding='utf-8')
 import docker
 
 NETWORK_NAME = "agent_consensus_net"

@@ -12,6 +12,8 @@ from node_app.core.invariants import InvariantViolation, validate_all
 from node_app.core.crypto import verify_envelope_signatures
 from node_app.core.consensus_tracker import ConsensusTracker
 from node_app.routers.consensus import router as consensus_router
+from node_app.routers.chaos import router as chaos_router
+from node_app.routers.chaos import ChaosMiddleware
 
 NODE_ID = os.environ["NODE_ID"]
 PRIVATE_KEY_HEX = os.environ["PRIVATE_KEY_HEX"]
@@ -43,8 +45,11 @@ app.state.peers = PEERS
 app.state.tracker = ConsensusTracker(n=len(PUBLIC_KEYS))
 app.state.ledger_lock = lock
 app.state.ledger_path = LEDGER_PATH
+app.state.fault_mode = "NONE"
 
+app.add_middleware(ChaosMiddleware)
 app.include_router(consensus_router)
+app.include_router(chaos_router)
 
 
 @app.get("/health")
