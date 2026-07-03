@@ -61,7 +61,7 @@ async def inject_fault(target: str, mode: str, drop_targets: list[str] | None):
     if drop_targets:
         payload["byzantine_targets"] = drop_targets
 
-    async with httpx.AsyncClient(timeout=5) as client:
+    async with httpx.AsyncClient(timeout=2.0) as client:
         r = await client.post(url, json=payload)
         r.raise_for_status()
         data = r.json()
@@ -136,7 +136,7 @@ async def main():
 
         print(f"\n=== Waiting for cluster health ===")
         import httpx
-        async with httpx.AsyncClient(timeout=3) as client:
+        async with httpx.AsyncClient(timeout=2.0) as client:
             for i in range(1, args.nodes + 1):
                 port = 8000 + i - 1
                 for attempt in range(20):
@@ -153,7 +153,7 @@ async def main():
 
         print("\n=== Verifying chaos endpoint on target ===")
         target_port = 8000 + int(args.target.split("_")[1]) - 1
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=2.0) as client:
             for retry in range(10):
                 try:
                     r = await client.get(

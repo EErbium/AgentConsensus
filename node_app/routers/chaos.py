@@ -155,7 +155,7 @@ async def _send_corrupted_broadcast(state, drop_peers, path, tx_id, seq):
     )
 
     endpoint = f"/{phase.lower()}"
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=2.0) as client:
         tasks = [
             client.post(f"http://{peer}:8000{endpoint}", json=payload)
             for peer in drop_peers

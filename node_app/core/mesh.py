@@ -28,12 +28,19 @@ async def broadcast_to_peers(
     peers: list[str],
     endpoint: str,
     payload: dict,
-) -> list[Exception | httpx.Response]:
+) -> list[Exception | httpx.Response | None]:
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(5.0),
+        timeout=httpx.Timeout(2.0),
     ) as client:
-        tasks = [
-            client.post(f"http://{peer}:8000{endpoint}", json=payload)
-            for peer in peers
-        ]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        results = []
+        for peer in peers:
+            try:
+                r = await client.post(
+                    f"http://{peer}:8000{endpoint}", json=payload
+                )
+                results.append(r)
+            except httpx.HTTPError:
+                results.append(None)
+            # Cooperatively yield to let the event loop process incoming packets
+            await asyncio.sleep(0.001)
+        return results

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections import defaultdict
 from node_app.schemas.transaction import TransactionEnvelope
 
@@ -54,6 +55,18 @@ class ConsensusTracker:
                 self.local_head = seq
                 return True, self.pre_prepares.get(seq)
             return False, None
+
+    async def force_garbage_collection(self, seq_num: int):
+        async with self.lock:
+            if self.local_stage.get(seq_num) != "COMMITTED":
+                logging.warning(
+                    f"Consensus stalled at slot {seq_num}. Evicting poisoned cache."
+                )
+                self.pre_prepares.pop(seq_num, None)
+                self.prepare_votes.pop(seq_num, None)
+                self.commit_votes.pop(seq_num, None)
+                self.local_head = seq_num
+                self.local_stage[seq_num] = "EVICTED"
 
     async def has_pre_prepare(self, seq: int) -> bool:
         async with self.lock:
