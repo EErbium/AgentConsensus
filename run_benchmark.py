@@ -1,11 +1,5 @@
 """
 One-shot benchmark: start cluster, inject Byzantine fault, profile, plot.
-
-Usage:
-    python run_benchmark.py                    # default 4 nodes, Byzantine on node_2
-    python run_benchmark.py --nodes 5 --target node_3
-    python run_benchmark.py --fault OFFLINE     # crash fault instead of Byzantine
-    python run_benchmark.py --quick             # small batch for smoke testing
 """
 import argparse
 import asyncio
@@ -13,180 +7,173 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import httpx
 
-BASE = Path(__file__).parent
+APP_ROOT = Path(__file__).parent
 
-FAULT_OFFLINE = "OFFLINE"
-FAULT_BYZANTINE = "MALICIOUS_BYZANTINE"
+OFFLINE_MODE = "OFFLINE"
+BYZANTINE_MODE = "MALICIOUS_BYZANTINE"
 
 
-async def run(cmd: list[str], desc: str, cwd: str | None = None) -> str:
-    print(f"\n=== {desc} ===")
+async def execute_sub_task(cmd: list[str], task_desc: str, working_dir: str | None = None) -> str:
+    print(f"\n=== {task_desc} ===")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=cwd or str(BASE),
+        cwd=working_dir or str(APP_ROOT),
     )
     stdout, stderr = await proc.communicate()
-    out = stdout.decode() if stdout else ""
-    err = stderr.decode() if stderr else ""
+    
+    output_text = stdout.decode() if stdout else ""
+    error_text = stderr.decode() if stderr else ""
+    
     if proc.returncode != 0:
-        print(out)
-        print(err, file=sys.stderr)
-        raise RuntimeError(f"{desc} failed (rc={proc.returncode})")
-    print(out)
-    return out
+        print(output_text)
+        print(error_text, file=sys.stderr)
+        raise RuntimeError(f"{task_desc} failed with exit code {proc.returncode}")
+        
+    print(output_text)
+    return output_text
 
 
-async def orchestrate_up(nodes: int):
-    await run(
-        [sys.executable, "orchestrate.py", "up", "-n", str(nodes)],
-        f"Starting {nodes}-node cluster",
+async def spin_up_cluster(node_count: int):
+    await execute_sub_task(
+        [sys.executable, "orchestrate.py", "up", "-n", str(node_count)],
+        f"Spinning up {node_count}-node consensus cluster",
     )
 
 
-async def orchestrate_down():
-    await run(
+async def tear_down_cluster():
+    await execute_sub_task(
         [sys.executable, "orchestrate.py", "down", "--clean"],
-        "Tearing down cluster",
+        "Tearing down active cluster",
     )
 
 
-async def inject_fault(target: str, mode: str, drop_targets: list[str] | None):
-    import httpx
+async def apply_adversarial_fault(victim_node: str, scenario: str, isolated_peers: list[str] | None):
+    node_id_number = int(victim_node.split('_')[1])
+    target_port = 8000 + node_id_number - 1
+    endpoint = f"http://127.0.0.1:{target_port}/chaos/fault"
+    
+    payload = {"mode": scenario}
+    if isolated_peers:
+        payload["byzantine_targets"] = isolated_peers
 
-    url = f"http://127.0.0.1:{8000 + int(target.split('_')[1]) - 1}/chaos/fault"
-    payload: dict = {"mode": mode}
-    if drop_targets:
-        payload["byzantine_targets"] = drop_targets
-
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        print(f"  Fault injected on {target}: {data}")
-        return data
+    async with httpx.AsyncClient(timeout=3.0) as http_client:
+        resp = await http_client.post(endpoint, json=payload)
+        resp.raise_for_status()
+        
+        status_report = resp.json()
+        print(f"  Adversarial environment injected into {victim_node}: {status_report}")
+        return status_report
 
 
-async def run_profiler(nodes: int, fault_mode: str, fault_count: int, quick: bool):
-    batches = "20,50" if quick else "100,500,1000"
-    cmd = [
+async def execute_perf_profile(node_count: int, scenario: str, total_faults: int, smoke_test: bool):
+    batch_sizes = "20,50" if smoke_test else "100,500,1000"
+    args_list = [
         sys.executable, "benchmarks/profiler.py",
-        "--nodes", str(nodes),
-        "--fault-mode", fault_mode,
-        "--fault-count", str(fault_count),
-        "--batches", batches,
+        "--nodes", str(node_count),
+        "--fault-mode", scenario,
+        "--fault-count", str(total_faults),
+        "--batches", batch_sizes,
     ]
-    await run(cmd, f"Running profiler (fault={fault_mode}, f={fault_count})")
+    await execute_sub_task(args_list, f"Profiling system performance (scenario={scenario}, f={total_faults})")
 
 
-async def plot_results():
-    await run(
+async def render_metrics():
+    await execute_sub_task(
         [sys.executable, "benchmarks/plot_results.py"],
-        "Generating charts",
+        "Rendering visualization charts",
     )
 
 
 async def main():
-    parser = argparse.ArgumentParser(
-        description="End-to-end Adversarial Benchmark for AgentConsensus"
-    )
-    parser.add_argument(
-        "--nodes", type=int, default=4,
-        help="Total nodes (default: 4)"
-    )
-    parser.add_argument(
-        "--target", type=str, default="node_2",
-        help="Node to make faulty (default: node_2)"
-    )
-    parser.add_argument(
-        "--fault", type=str, default=FAULT_BYZANTINE,
-        choices=[FAULT_OFFLINE, FAULT_BYZANTINE],
-        help="Fault type (default: MALICIOUS_BYZANTINE)"
-    )
-    parser.add_argument(
-        "--quick", action="store_true",
-        help="Small batches (20, 50) for a quick smoke test"
-    )
-    args = parser.parse_args()
+    cli = argparse.ArgumentParser(description="End-to-end Adversarial Benchmark for AgentConsensus")
+    cli.add_argument("--nodes", type=int, default=4, help="Total system nodes")
+    cli.add_argument("--target", type=str, default="node_2", help="Target node for error simulation")
+    cli.add_argument("--fault", type=str, default=BYZANTINE_MODE, choices=[OFFLINE_MODE, BYZANTINE_MODE])
+    cli.add_argument("--quick", action="store_true", help="Execute rapid smoke test parameters")
+    args = cli.parse_args()
 
-    target_idx = int(args.target.split("_")[1])
-    target_port = 8000 + target_idx - 1
-
-    if args.fault == FAULT_BYZANTINE:
-        drop_peers = [
-            f"node_{i}"
-            for i in range(1, args.nodes + 1)
-            if i != target_idx and i > args.nodes // 2
-        ] or [f"node_{1 if target_idx != 1 else 2}"]
-    else:
-        drop_peers = None
+    victim_idx = int(args.target.split("_")[1])
+    
+    isolated_peers = None
+    if args.fault == BYZANTINE_MODE:
+        isolated_peers = [
+            f"node_{idx}"
+            for idx in range(1, args.nodes + 1)
+            if idx != victim_idx and idx > args.nodes // 2
+        ] or [f"node_{1 if victim_idx != 1 else 2}"]
 
     try:
-        await orchestrate_down()
+        await tear_down_cluster()
 
-        print("Forcing clean Docker build ...")
+        # Hard purge stale layers to force image synchronization
         subprocess.run(
             ["docker", "rmi", "-f", "agent-consensus-node"],
             capture_output=True, text=True,
         )
 
-        await orchestrate_up(args.nodes)
+        await spin_up_cluster(args.nodes)
 
-        print(f"\n=== Waiting for cluster health ===")
-        import httpx
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            for i in range(1, args.nodes + 1):
-                port = 8000 + i - 1
-                for attempt in range(20):
+        print("\n=== Poll Cluster Node Readiness ===")
+        async with httpx.AsyncClient(timeout=1.5) as check_client:
+            for idx in range(1, args.nodes + 1):
+                node_port = 8000 + idx - 1
+                health_url = f"http://127.0.0.1:{node_port}/health"
+                
+                online = False
+                for _ in range(25):
                     try:
-                        r = await client.get(f"http://127.0.0.1:{port}/health")
-                        if r.status_code == 200:
-                            print(f"  node_{i} ready (port {port})")
+                        resp = await check_client.get(health_url)
+                        if resp.status_code == 200:
+                            print(f"  node_{idx} responded on port {node_port}")
+                            online = True
                             break
                     except Exception:
                         pass
                     await asyncio.sleep(1)
-                else:
-                    print(f"  WARNING: node_{i} not ready after 20s")
+                    
+                if not online:
+                    print(f"  WARNING: node_{idx} failed startup validation within timeout limits")
 
-        print("\n=== Verifying chaos endpoint on target ===")
-        target_port = 8000 + int(args.target.split("_")[1]) - 1
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            for retry in range(10):
+        print("\n=== Verify Chaos Engine Subsystem ===")
+        target_port = 8000 + victim_idx - 1
+        chaos_status_url = f"http://127.0.0.1:{target_port}/chaos/status"
+        
+        chaos_ready = False
+        async with httpx.AsyncClient(timeout=2.0) as check_client:
+            for attempt in range(10):
                 try:
-                    r = await client.get(
-                        f"http://127.0.0.1:{target_port}/chaos/status"
-                    )
-                    print(f"  {r.json()}")
+                    resp = await check_client.get(chaos_status_url)
+                    print(f"  Chaos subsystem status: {resp.json()}")
+                    chaos_ready = True
                     break
-                except Exception as e:
-                    print(f"  retry {retry+1}: waiting ... ({e})")
+                except Exception as connection_error:
+                    print(f"  Polling chaos endpoint (attempt {attempt+1}/10)... ({connection_error})")
                     await asyncio.sleep(2)
-            else:
-                raise RuntimeError(
-                    f"Chaos endpoint not available on {args.target} "
-                    f"(port {target_port})"
-                )
+                    
+            if not chaos_ready:
+                raise RuntimeError(f"Chaos endpoint unreachable on {args.target} via port {target_port}")
 
-        await inject_fault(args.target, args.fault, drop_peers)
-
-        await run_profiler(args.nodes, args.fault, 1, args.quick)
-        await plot_results()
+        await apply_adversarial_fault(args.target, args.fault, isolated_peers)
+        await execute_perf_profile(args.nodes, args.fault, 1, args.quick)
+        await render_metrics()
 
         print(f"\n{'='*60}")
-        print("Benchmark complete!")
-        print(f"  Results:  benchmarks/results.csv")
-        print(f"  Charts:   benchmarks/charts/")
+        print("Adversarial scenario execution finished.")
+        print(f"  Metrics CSV:  benchmarks/results.csv")
+        print(f"  Output Plots: benchmarks/charts/")
         print(f"{'='*60}")
 
-    except Exception as e:
-        print(f"\nERROR: {e}")
+    except Exception as runtime_fault:
+        print(f"\nExecution Aborted: {runtime_fault}")
         sys.exit(1)
+        
     finally:
         try:
-            await orchestrate_down()
+            await tear_down_cluster()
         except Exception:
             pass
 

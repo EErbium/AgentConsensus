@@ -6,494 +6,388 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
-
 import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from node_app.core.crypto import compute_tx_id, sign_payload, verify_signature
+from node_app.core.crypto import compute_tx_id, sign_payload
 from node_app.schemas.transaction import ExecutionPayload, TransactionEnvelope
 
 PROJECT_ROOT = Path(__file__).parent.parent
-TOPOLOGY_PATH = PROJECT_ROOT / "topology.json"
-KEYS_PATH = PROJECT_ROOT / "keys.json"
-ORCHESTRATE = PROJECT_ROOT / "orchestrate.py"
+TOPOLOGY_FILE = PROJECT_ROOT / "topology.json"
+KEYS_FILE = PROJECT_ROOT / "keys.json"
+METRICS_CSV = PROJECT_ROOT / "benchmarks" / "results.csv"
 
-RESULTS_CSV = PROJECT_ROOT / "benchmarks" / "results.csv"
+OFFLINE_MODE = "OFFLINE"
+BYZANTINE_MODE = "MALICIOUS_BYZANTINE"
+HEALTHY_MODE = "NONE"
 
-FAULT_NONE = "NONE"
-FAULT_OFFLINE = "OFFLINE"
-FAULT_BYZANTINE = "MALICIOUS_BYZANTINE"
-
-_leader_idx = 0
+_current_leader_idx = 0
 
 
-def load_keys():
-    with open(TOPOLOGY_PATH) as f:
-        topology = json.load(f)
-    with open(KEYS_PATH) as f:
-        private_keys = json.load(f)
-    return topology, private_keys
+def load_cluster_keys():
+    with open(TOPOLOGY_FILE) as f:
+        cluster_map = json.load(f)
+    with open(KEYS_FILE) as f:
+        secret_keys = json.load(f)
+    return cluster_map, secret_keys
 
 
-def get_port(node_name: str) -> int:
-    idx = int(node_name.split("_")[1])
-    return 8000 + idx - 1
+def get_node_port(node_name: str) -> int:
+    return 8000 + int(node_name.split("_")[1]) - 1
 
 
-def get_node_url(node_name: str) -> str:
-    return f"http://127.0.0.1:{get_port(node_name)}"
+def get_node_endpoint(node_name: str) -> str:
+    return f"http://127.0.0.1:{get_node_port(node_name)}"
 
 
-def build_envelope(
-    proposer: str,
-    seq: int,
-    private_key_hex: str,
-) -> dict:
-    now = int(time.time())
-    payload = ExecutionPayload(
+def generate_tx_payload(proposer: str, sequence_num: int, secret_key: str) -> dict:
+    now_ts = int(time.time())
+    tx_action = ExecutionPayload(
         action="ALLOCATE_FUNDS",
         target_recipient="alice",
         asset_amount=50.0,
         denomination="USD",
     )
-    canonical = json.dumps(
-        payload.model_dump(mode="json"),
+    serialized_payload = json.dumps(
+        tx_action.model_dump(mode="json"),
         sort_keys=True,
         separators=(",", ":"),
     )
-    tx_id = compute_tx_id(proposer, seq, now, canonical)
-
-    sig = sign_payload(private_key_hex, tx_id.encode())
+    tx_id = compute_tx_id(proposer, sequence_num, now_ts, serialized_payload)
+    signature = sign_payload(secret_key, tx_id.encode())
 
     envelope = TransactionEnvelope(
         tx_id=tx_id,
         proposer_node=proposer,
-        sequence_number=seq,
-        timestamp=now,
-        execution_payload=payload,
+        sequence_number=sequence_num,
+        timestamp=now_ts,
+        execution_payload=tx_action,
         llm_reasoning_hash="0" * 64,
-        signatures={proposer: sig},
+        signatures={proposer: signature},
     )
     return envelope.model_dump(mode="json")
 
 
-async def wait_for_cluster(topology: dict, timeout: float = 30.0) -> bool:
-    async with httpx.AsyncClient(timeout=2.0) as client:
+async def wait_for_cluster_startup(cluster_map: dict, timeout: float = 60.0) -> bool:
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
         deadline = time.monotonic() + timeout
-        nodes = list(topology["nodes"].keys())
+        node_names = list(cluster_map["nodes"].keys())
+        
         while time.monotonic() < deadline:
-            ready = 0
-            for name in nodes:
+            ready_nodes = 0
+            for name in node_names:
                 try:
-                    r = await client.get(f"{get_node_url(name)}/health")
-                    if r.status_code == 200:
-                        ready += 1
+                    resp = await http_client.get(f"{get_node_endpoint(name)}/health")
+                    if resp.status_code == 200:
+                        ready_nodes += 1
                 except Exception:
                     pass
-            if ready == len(nodes):
+                    
+            if ready_nodes == len(node_names):
                 return True
             await asyncio.sleep(1)
+            
     return False
 
 
-async def inject_fault(
-    target_node: str,
-    mode: str,
-    byzantine_targets: list[str] | None = None,
-):
-    url = f"{get_node_url(target_node)}/chaos/fault"
-    payload: dict = {"mode": mode}
-    if byzantine_targets:
-        payload["byzantine_targets"] = byzantine_targets
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        return r.json()
+async def apply_adversarial_fault(node_name: str, mode: str, drop_set: list[str] | None = None):
+    url = f"{get_node_endpoint(node_name)}/chaos/fault"
+    payload = {"mode": mode}
+    if drop_set:
+        payload["byzantine_targets"] = drop_set
+        
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
+        resp = await http_client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
 
-async def clear_fault(target_node: str):
-    url = f"{get_node_url(target_node)}/chaos/reset"
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        r = await client.post(url)
-        r.raise_for_status()
-        return r.json()
+async def clear_adversarial_fault(node_name: str):
+    url = f"{get_node_endpoint(node_name)}/chaos/reset"
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
+        resp = await http_client.post(url)
+        resp.raise_for_status()
+        return resp.json()
 
 
-async def send_pre_prepare(
-    client: httpx.AsyncClient,
-    node_url: str,
-    envelope: dict,
-) -> tuple[float, int]:
-    t0 = time.monotonic()
-    r = await client.post(f"{node_url}/pre-prepare", json=envelope)
-    t1 = time.monotonic()
-    return (t1 - t0) * 1000, r.status_code
-
-
-async def reset_node_head(client: httpx.AsyncClient, node_url: str, target_seq: int):
+async def dispatch_pre_prepare(http_client: httpx.AsyncClient, node_url: str, payload: dict) -> tuple[float, int]:
+    start_time = time.monotonic()
     try:
-        await client.post(
-            f"{node_url}/reset-head",
-            json={"target_sequence": target_seq},
-        )
+        resp = await http_client.post(f"{node_url}/pre-prepare", json=payload)
+        return (time.monotonic() - start_time) * 1000, resp.status_code
+    except Exception:
+        return (time.monotonic() - start_time) * 1000, 500
+
+
+async def force_node_head_reset(http_client: httpx.AsyncClient, node_url: str, next_seq: int):
+    try:
+        await http_client.post(f"{node_url}/reset-head", json={"target_sequence": next_seq})
     except Exception:
         pass
 
 
-async def check_ledger(
-    client: httpx.AsyncClient,
-    node_url: str,
-    expected_tx_id: str,
-) -> bool:
-    try:
-        r = await client.get(f"{node_url}/ledger", timeout=3.0)
-        if r.status_code != 200:
-            return False
-        ledger = r.json()
-        return any(entry["tx_id"] == expected_tx_id for entry in ledger)
-    except Exception:
-        return False
-
-
-async def run_batch(
-    topology: dict,
-    private_keys: dict,
+async def execute_batch_run(
+    cluster_map: dict,
+    secret_keys: dict,
     proposer: str,
-    start_seq: int,
-    batch_size: int,
-    fault_mode: str,
-    faulty_nodes: list[str],
-    byzantine_targets: list[str] | None,
+    base_sequence: int,
+    size: int,
+    scenario_mode: str,
+    offline_nodes: list[str],
 ) -> list[dict]:
-    global _leader_idx
-    nodes = sorted(topology["nodes"].keys())
-    honest_nodes = [n for n in nodes if n not in faulty_nodes]
-    results = []
+    global _current_leader_idx
+    node_names = sorted(cluster_map["nodes"].keys())
+    healthy_nodes = [name for name in node_names if name not in offline_nodes]
+    batch_records = []
 
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for i in range(batch_size):
-            seq = start_seq + i
-            t0 = time.monotonic()
-            all_latencies = []
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
+        for idx in range(size):
+            sequence_num = base_sequence + idx
+            start_mark = time.monotonic()
+            round_latencies = []
+            committed_successfully = False
 
-            tx_accepted = False
-            for attempt in range(len(nodes)):
-                leader = nodes[_leader_idx]
-                envelope = build_envelope(leader, seq, private_keys[leader])
+            for _ in range(len(node_names)):
+                leader = node_names[_current_leader_idx]
+                tx_payload = generate_tx_payload(leader, sequence_num, secret_keys[leader])
 
                 tasks = []
-                for name in nodes:
-                    if fault_mode == FAULT_OFFLINE and name in faulty_nodes:
+                for name in node_names:
+                    if scenario_mode == OFFLINE_MODE and name in offline_nodes:
                         continue
-                    tasks.append(
-                        send_pre_prepare(client, get_node_url(name), envelope)
-                    )
+                    tasks.append(dispatch_pre_prepare(http_client, get_node_endpoint(name), tx_payload))
 
                 outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for outcome in outcomes:
                     if isinstance(outcome, tuple):
-                        lat, code = outcome
-                        all_latencies.append(lat)
-                        if code in (200, 201, 202):
-                            tx_accepted = True
-                    elif isinstance(outcome, Exception):
-                        all_latencies.append(None)
+                        latency_ms, http_status = outcome
+                        round_latencies.append(latency_ms)
+                        if http_status in (200, 201, 202):
+                            committed_successfully = True
+                    else:
+                        round_latencies.append(None)
 
-                if tx_accepted:
+                if committed_successfully:
                     break
 
-                _leader_idx = (_leader_idx + 1) % len(nodes)
+                _current_leader_idx = (_current_leader_idx + 1) % len(node_names)
 
-            valid_lats = [l for l in all_latencies if l is not None]
-            avg_latency = sum(valid_lats) / len(valid_lats) if valid_lats else 0.0
-
-            t1 = time.monotonic()
-            total_latency = (t1 - t0) * 1000
+            valid_latencies = [l for l in round_latencies if l is not None]
+            avg_preprepare = sum(valid_latencies) / len(valid_latencies) if valid_latencies else 0.0
+            total_duration = (time.monotonic() - start_mark) * 1000
 
             await asyncio.sleep(0.05)
 
-            results.append({
-                "tx_id": envelope["tx_id"],
-                "batch_size": batch_size,
-                "tx_index": i,
-                "fault_scenario": f"{fault_mode}_{len(faulty_nodes)}f",
-                "latency_ms": round(total_latency, 2),
-                "avg_preprepare_latency_ms": round(avg_latency, 2),
+            batch_records.append({
+                "tx_id": tx_payload["tx_id"],
+                "batch_size": size,
+                "tx_index": idx,
+                "fault_scenario": f"{scenario_mode}_{len(offline_nodes)}f",
+                "latency_ms": round(total_duration, 2),
+                "avg_preprepare_latency_ms": round(avg_preprepare, 2),
                 "accepted_count": 0,
                 "status": "PENDING",
             })
 
-        # Wait briefly for consensus to propagate
         await asyncio.sleep(0.5)
 
-        # Fast-path: query in-memory tracker state (no disk I/O)
-        any_failed = False
-        for record in results:
-            seq = start_seq + record["tx_index"]
-            accepted_count = 0
-            for name in honest_nodes:
+        stalled_any = False
+        for record in batch_records:
+            target_seq = base_sequence + record["tx_index"]
+            nodes_committed = 0
+            
+            for name in healthy_nodes:
                 try:
-                    r = await client.get(
-                        f"{get_node_url(name)}/verify-tx/{seq}",
-                        timeout=0.5,
-                    )
-                    if r.status_code == 200 and r.json().get("committed") == True:
-                        accepted_count += 1
+                    resp = await http_client.get(f"{get_node_endpoint(name)}/verify-tx/{target_seq}", timeout=0.5)
+                    if resp.status_code == 200 and resp.json().get("committed") is True:
+                        nodes_committed += 1
                 except Exception:
                     pass
-            record["accepted_count"] = accepted_count
-            record["status"] = "OK" if accepted_count >= 3 else "FAIL"
+                    
+            record["accepted_count"] = nodes_committed
+            record["status"] = "OK" if nodes_committed >= 3 else "FAIL"
             if record["status"] == "FAIL":
-                any_failed = True
+                stalled_any = True
 
-        # Reset head on all nodes if any transaction stalled
-        if any_failed:
-            next_seq = start_seq + batch_size
+        if stalled_any:
+            recovery_target = base_sequence + size
             reset_tasks = [
-                reset_node_head(client, get_node_url(name), next_seq - 1)
-                for name in nodes
+                force_node_head_reset(http_client, get_node_endpoint(name), recovery_target - 1)
+                for name in node_names
             ]
             await asyncio.gather(*reset_tasks, return_exceptions=True)
 
-    return results
+    return batch_records
 
 
-async def verify_state_convergence(
-    topology: dict,
-    expected_tx_ids: set[str],
-) -> dict:
-    nodes = sorted(topology["nodes"].keys())
-    node_ledgers: dict[str, set[str]] = {}
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for name in nodes:
+async def verify_cluster_convergence(cluster_map: dict, valid_tx_ids: set[str]) -> dict:
+    node_names = sorted(cluster_map["nodes"].keys())
+    state_snapshots = {}
+    
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
+        for name in node_names:
             try:
-                r = await client.get(f"{get_node_url(name)}/ledger")
-                if r.status_code == 200:
-                    ledger = r.json()
-                    node_ledgers[name] = {e["tx_id"] for e in ledger}
+                resp = await http_client.get(f"{get_node_endpoint(name)}/ledger")
+                if resp.status_code == 200:
+                    state_snapshots[name] = {entry["tx_id"] for entry in resp.json()}
                 else:
-                    node_ledgers[name] = set()
+                    state_snapshots[name] = set()
             except Exception:
-                node_ledgers[name] = set()
+                state_snapshots[name] = set()
 
-    committed = [v for v in node_ledgers.values() if v]
-    all_same = all(v == committed[0] for v in committed) if committed else True
+    active_ledgers = [tx_set for tx_set in state_snapshots.values() if tx_set]
+    synchronized = all(tx_set == active_ledgers[0] for tx_set in active_ledgers) if active_ledgers else True
+    
     return {
-        "all_nodes_converged": all_same,
-        "node_tx_counts": {n: len(tx) for n, tx in node_ledgers.items()},
+        "all_nodes_converged": synchronized,
+        "node_tx_counts": {name: len(tx_set) for name, tx_set in state_snapshots.items()},
         "total_committed_across_nodes": {
-            n: len(expected_tx_ids & tx) for n, tx in node_ledgers.items()
+            name: len(valid_tx_ids & tx_set) for name, tx_set in state_snapshots.items()
         },
     }
 
 
-async def orchestrate_up(n: int):
-    result = subprocess.run(
-        [sys.executable, str(ORCHESTRATE), "up", "-n", str(n)],
-        capture_output=True,
-        text=True,
-        cwd=str(PROJECT_ROOT),
+def spawn_cluster_infrastructure(node_count: int):
+    process_run = subprocess.run(
+        [sys.executable, "orchestrate.py", "up", "-n", str(node_count)],
+        capture_output=True, text=True, cwd=str(PROJECT_ROOT)
     )
-    print(result.stdout)
-    if result.returncode != 0:
-        print(result.stderr)
-        raise RuntimeError(f"orchestrate.py up failed: {result.stderr}")
+    print(process_run.stdout)
+    if process_run.returncode != 0:
+        raise RuntimeError(f"Orchestration setup failed: {process_run.stderr}")
 
 
-async def orchestrate_down(clean: bool = True):
-    cmd = [sys.executable, str(ORCHESTRATE), "down"]
-    if clean:
-        cmd.append("--clean")
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT)
+def tear_down_cluster_infrastructure():
+    process_run = subprocess.run(
+        [sys.executable, "orchestrate.py", "down", "--clean"],
+        capture_output=True, text=True, cwd=str(PROJECT_ROOT)
     )
-    print(result.stdout)
-    if result.returncode != 0:
-        print(result.stderr)
-        raise RuntimeError(f"orchestrate.py down failed: {result.stderr}")
+    print(process_run.stdout)
+    if process_run.returncode != 0:
+        raise RuntimeError(f"Orchestration cleanup failed: {process_run.stderr}")
 
 
-async def run_scenario(
-    total_nodes: int,
-    fault_mode: str,
-    faulty_count: int,
-    batch_sizes: list[int],
-):
-    print(f"\n{'='*60}")
-    print(f"SCENARIO: n={total_nodes}, fault={fault_mode}, f_count={faulty_count}")
-    print(f"{'='*60}")
-
-    await orchestrate_down(clean=True)
+async def execute_scenario(node_count: int, scenario_mode: str, faulty_count: int, batch_sizes: list[int]):
+    print(f"\nEvaluating: n={node_count}, scenario={scenario_mode}, faults={faulty_count}")
+    
+    tear_down_cluster_infrastructure()
+    await asyncio.sleep(1)
+    spawn_cluster_infrastructure(node_count)
     await asyncio.sleep(2)
-    await orchestrate_up(total_nodes)
-    await asyncio.sleep(3)
 
-    topology, private_keys = load_keys()
-    nodes = sorted(topology["nodes"].keys())
+    cluster_map, secret_keys = load_cluster_keys()
+    node_names = sorted(cluster_map["nodes"].keys())
 
-    if not await wait_for_cluster(topology, timeout=60):
-        raise RuntimeError("Cluster did not become ready in time")
+    if not await wait_for_cluster_startup(cluster_map):
+        raise RuntimeError("Nodes failed health checks during initialization timeframe")
 
-    print(f"Cluster ready: {len(nodes)} nodes")
+    # Keep node_1 out of faulty lists to preserve primary pipeline where possible
+    candidate_faulty = [name for name in node_names if name != node_names[0]]
+    assigned_faulty = candidate_faulty[:faulty_count] if faulty_count > 0 else []
+    drop_set = None
 
-    # Never assign the fault flag to the primary leader (node_1)
-    backup_nodes = [n for n in nodes if n != nodes[0]]
-    faulty_nodes = backup_nodes[:faulty_count] if faulty_count > 0 else []
-    byzantine_targets = None
+    if scenario_mode == OFFLINE_MODE and assigned_faulty:
+        for name in assigned_faulty:
+            await apply_adversarial_fault(name, OFFLINE_MODE)
 
-    if fault_mode == FAULT_OFFLINE and faulty_nodes:
-        print(f"Injecting OFFLINE fault on: {faulty_nodes}")
-        for fn in faulty_nodes:
-            await inject_fault(fn, FAULT_OFFLINE)
+    elif scenario_mode == BYZANTINE_MODE and assigned_faulty:
+        honest_nodes = [name for name in node_names if name not in assigned_faulty]
+        drop_set = honest_nodes[len(honest_nodes) // 2:] or honest_nodes[:1]
+        for name in assigned_faulty:
+            await apply_adversarial_fault(name, BYZANTINE_MODE, drop_set=drop_set)
 
-    elif fault_mode == FAULT_BYZANTINE and faulty_nodes:
-        print(f"Injecting MALICIOUS_BYZANTINE fault on: {faulty_nodes}")
-        honest_nodes = [n for n in nodes if n not in faulty_nodes]
-        byzantine_targets = honest_nodes[len(honest_nodes) // 2:] or honest_nodes[:1]
-        for fn in faulty_nodes:
-            await inject_fault(
-                fn,
-                FAULT_BYZANTINE,
-                byzantine_targets=byzantine_targets,
-            )
+    current_sequence = 1
+    collected_metrics = []
 
-    if fault_mode != FAULT_NONE and faulty_nodes:
-        print(f"   Byzantine targets (drop set): {byzantine_targets}")
-
-    proposer = nodes[0]
-    seq = 1
-    all_results = []
-
-    for batch_size in batch_sizes:
-        print(f"\n  --- Batch size: {batch_size} ---")
-        batch_results = await run_batch(
-            topology=topology,
-            private_keys=private_keys,
-            proposer=proposer,
-            start_seq=seq,
-            batch_size=batch_size,
-            fault_mode=fault_mode,
-            faulty_nodes=faulty_nodes,
-            byzantine_targets=byzantine_targets,
+    for size in batch_sizes:
+        print(f"  Executing Tx Batch Segment Size -> {size}")
+        segment_metrics = await execute_batch_run(
+            cluster_map, secret_keys, node_names[0], current_sequence, size, scenario_mode, assigned_faulty
         )
-        seq += batch_size
+        current_sequence += size
 
-        ok_count = sum(1 for r in batch_results if r["status"] == "OK")
-        latencies = [r["latency_ms"] for r in batch_results if r["status"] == "OK"]
-        avg_lat = sum(latencies) / len(latencies) if latencies else 0
-        total_time = sum(latencies) / 1000 if latencies else 1
-        tps = ok_count / total_time if total_time > 0 else 0
+        successful_count = sum(1 for entry in segment_metrics if entry["status"] == "OK")
+        valid_latencies = [entry["latency_ms"] for entry in segment_metrics if entry["status"] == "OK"]
+        avg_lat = sum(valid_latencies) / len(valid_latencies) if valid_latencies else 0.0
+        total_seconds = sum(valid_latencies) / 1000.0 if valid_latencies else 1.0
+        calculated_tps = successful_count / total_seconds if total_seconds > 0 else 0.0
 
-        print(f"     OK: {ok_count}/{batch_size}, "
-              f"Avg Latency: {avg_lat:.1f}ms, TPS: {tps:.1f}")
-        all_results.extend(batch_results)
+        print(f"    Consensus Ok: {successful_count}/{size} | Mean Latency: {avg_lat:.1f}ms | Throughput: {calculated_tps:.1f} TPS")
+        collected_metrics.extend(segment_metrics)
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
 
-    fault_scenario = f"{fault_mode}_{faulty_count}f"
-    convergence = await verify_state_convergence(
-        topology,
-        {r["tx_id"] for r in all_results if r["status"] == "OK"},
-    )
-    print(f"\n  State Convergence: {convergence}")
+    successful_tx_ids = {entry["tx_id"] for entry in collected_metrics if entry["status"] == "OK"}
+    convergence_report = await verify_cluster_convergence(cluster_map, successful_tx_ids)
+    print(f"  Consistency Matrix -> {convergence_report}")
 
-    if fault_mode != FAULT_NONE and faulty_nodes:
-        print(f"  Clearing faults on faulty nodes...")
-        for fn in faulty_nodes:
-            await clear_fault(fn)
+    if scenario_mode != HEALTHY_MODE and assigned_faulty:
+        for name in assigned_faulty:
+            await clear_adversarial_fault(name)
 
-    await orchestrate_down(clean=True)
+    tear_down_cluster_infrastructure()
 
-    for r in all_results:
-        r["fault_scenario"] = fault_scenario
-        r["total_nodes"] = total_nodes
-        r["faulty_count"] = faulty_count
+    for entry in collected_metrics:
+        entry["fault_scenario"] = f"{scenario_mode}_{faulty_count}f"
+        entry["total_nodes"] = node_count
+        entry["faulty_count"] = faulty_count
 
-    return all_results, convergence
+    return collected_metrics
 
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description="AgentConsensus Adversarial Benchmark Profiler"
-    )
-    parser.add_argument(
-        "--nodes", type=int, default=4,
-        help="Total nodes in the cluster (default: 4)"
-    )
-    parser.add_argument(
-        "--fault-mode", type=str, default=FAULT_NONE,
-        choices=[FAULT_NONE, FAULT_OFFLINE, FAULT_BYZANTINE],
-        help="Fault mode to inject"
-    )
-    parser.add_argument(
-        "--fault-count", type=int, default=0,
-        help="Number of faulty nodes (default: 0)"
-    )
-    parser.add_argument(
-        "--batches", type=str, default="100,500,1000",
-        help="Comma-separated batch sizes (default: 100,500,1000)"
-    )
-    parser.add_argument(
-        "--run-matrix", action="store_true",
-        help="Run the full 3-run test matrix instead of a single scenario"
-    )
-    args = parser.parse_args()
-
-    batch_sizes = [int(b.strip()) for b in args.batches.split(",")]
-
-    if args.run_matrix:
-        matrix = [
-            (4, FAULT_NONE, 0),
-            (4, FAULT_OFFLINE, 1),
-            (4, FAULT_BYZANTINE, 1),
-            (4, FAULT_OFFLINE, 2),
-            (4, FAULT_BYZANTINE, 2),
-        ]
-    else:
-        matrix = [(args.nodes, args.fault_mode, args.fault_count)]
-
-    all_scenario_results = []
-
-    for n, fault, fcount in matrix:
-        try:
-            scenario_results, convergence = await run_scenario(
-                total_nodes=n,
-                fault_mode=fault,
-                faulty_count=fcount,
-                batch_sizes=batch_sizes,
-            )
-            all_scenario_results.extend(scenario_results)
-        except Exception as e:
-            print(f"Scenario FAILED: {e}")
-            try:
-                await orchestrate_down(clean=True)
-            except Exception:
-                pass
-
-    if all_scenario_results:
-        write_csv(all_scenario_results)
-        print(f"\nResults written to {RESULTS_CSV}")
-    else:
-        print("\nNo results collected.")
-
-
-def write_csv(results: list[dict]):
+def flush_metrics_to_disk(all_runs: list[dict]):
     fieldnames = [
         "total_nodes", "faulty_count", "fault_scenario",
         "batch_size", "tx_index", "tx_id",
         "latency_ms", "avg_preprepare_latency_ms",
         "accepted_count", "status",
     ]
-    with open(RESULTS_CSV, "w", newline="") as f:
+    with open(METRICS_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for r in results:
-            writer.writerow({k: r.get(k, "") for k in fieldnames})
-    print(f"Wrote {len(results)} rows to {RESULTS_CSV}")
+        for record in all_runs:
+            writer.writerow({k: record.get(k, "") for k in fieldnames})
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="AgentConsensus Performance Profiling Tool Suite")
+    parser.add_argument("--nodes", type=int, default=4)
+    parser.add_argument("--fault-mode", type=str, default=HEALTHY_MODE, choices=[HEALTHY_MODE, OFFLINE_MODE, BYZANTINE_MODE])
+    parser.add_argument("--fault-count", type=int, default=0)
+    parser.add_argument("--batches", type=str, default="100,500,1000")
+    parser.add_argument("--run-matrix", action="store_true")
+    args = parser.parse_args()
+
+    batch_sizes = [int(size_str.strip()) for size_str in args.batches.split(",")]
+    
+    execution_matrix = [(args.nodes, args.fault_mode, args.fault_count)]
+    if args.run_matrix:
+        execution_matrix = [
+            (4, HEALTHY_MODE, 0),
+            (4, OFFLINE_MODE, 1),
+            (4, BYZANTINE_MODE, 1),
+            (4, OFFLINE_MODE, 2),
+            (4, BYZANTINE_MODE, 2),
+        ]
+
+    aggregated_runs = []
+    for count, mode, errors in execution_matrix:
+        try:
+            run_metrics = await execute_scenario(count, mode, errors, batch_sizes)
+            aggregated_runs.extend(run_metrics)
+        except Exception as scenario_fault:
+            print(f"Pipeline Interrupted during scenario execution: {scenario_fault}")
+            tear_down_cluster_infrastructure()
+
+    if not aggregated_runs:
+        print("\nBenchmark completed with zero records harvested.")
+        return
+
+    flush_metrics_to_disk(aggregated_runs)
+    print(f"\nTelemetry successfully flushed to disk -> {METRICS_CSV}")
 
 
 if __name__ == "__main__":

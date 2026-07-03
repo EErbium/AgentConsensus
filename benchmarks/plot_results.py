@@ -1,6 +1,7 @@
 import argparse
 import csv
 from pathlib import Path
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -8,67 +9,71 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).parent.parent
-RESULTS_CSV = PROJECT_ROOT / "benchmarks" / "results.csv"
-OUTPUT_DIR = PROJECT_ROOT / "benchmarks" / "charts"
+METRICS_CSV = PROJECT_ROOT / "benchmarks" / "results.csv"
+CHART_OUT_DIR = PROJECT_ROOT / "benchmarks" / "charts"
 
 
-def load_results(csv_path: str) -> list[dict]:
-    rows = []
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
+def parse_metrics_file(filepath: Path) -> list[dict]:
+    with open(filepath, newline="") as f:
+        return list(csv.DictReader(f))
 
 
-def compute_aggregates(rows: list[dict]) -> dict:
-    groups: dict[str, dict] = {}
-    for r in rows:
-        scenario = r["fault_scenario"]
-        batch = int(r["batch_size"])
-        key = (scenario, batch)
-        if key not in groups:
-            groups[key] = {"latencies": [], "ok": 0, "total": 0, "faulty_count": int(r["faulty_count"])}
-        groups[key]["latencies"].append(float(r["latency_ms"]))
-        groups[key]["total"] += 1
-        if r["status"] == "OK":
-            groups[key]["ok"] += 1
+def roll_up_benchmarks(records: list[dict]) -> dict:
+    grouped_runs = {}
+    for entry in records:
+        scenario = entry["fault_scenario"]
+        batch_size = int(entry["batch_size"])
+        run_key = (scenario, batch_size)
+        
+        if run_key not in grouped_runs:
+            grouped_runs[run_key] = {
+                "latencies": [], 
+                "successful_tx": 0, 
+                "total_tx": 0, 
+                "faulty_nodes": int(entry["faulty_count"])
+            }
+            
+        grouped_runs[run_key]["latencies"].append(float(entry["latency_ms"]))
+        grouped_runs[run_key]["total_tx"] += 1
+        if entry["status"] == "OK":
+            grouped_runs[run_key]["successful_tx"] += 1
 
-    aggregates = {}
-    for (scenario, batch), g in groups.items():
-        if g["latencies"]:
-            avg_lat = np.mean(g["latencies"])
-            p50 = np.percentile(g["latencies"], 50)
-            p95 = np.percentile(g["latencies"], 95)
-            p99 = np.percentile(g["latencies"], 99)
-        else:
-            avg_lat = p50 = p95 = p99 = 0.0
-        total_time_s = sum(g["latencies"]) / 1000 if g["latencies"] else 1
-        tps = g["ok"] / total_time_s if total_time_s > 0 else 0
-        aggregates[(scenario, batch)] = {
+    summary_matrix = {}
+    for (scenario, batch_size), metrics in grouped_runs.items():
+        durations = metrics["latencies"]
+        
+        avg_lat = np.mean(durations) if durations else 0.0
+        p50 = np.percentile(durations, 50) if durations else 0.0
+        p95 = np.percentile(durations, 95) if durations else 0.0
+        p99 = np.percentile(durations, 99) if durations else 0.0
+        
+        total_time_ms = sum(durations) if durations else 1000.0
+        tps = (metrics["successful_tx"] / (total_time_ms / 1000.0)) if total_time_ms > 0 else 0.0
+        
+        summary_matrix[(scenario, batch_size)] = {
             "scenario": scenario,
-            "batch": batch,
-            "faulty_count": g["faulty_count"],
-            "ok": g["ok"],
-            "total": g["total"],
+            "batch": batch_size,
+            "faulty_count": metrics["faulty_nodes"],
+            "ok": metrics["successful_tx"],
+            "total": metrics["total_tx"],
             "avg_latency_ms": round(avg_lat, 1),
             "p50_ms": round(p50, 1),
             "p95_ms": round(p95, 1),
             "p99_ms": round(p99, 1),
             "throughput_tps": round(tps, 1),
         }
-    return aggregates
+    return summary_matrix
 
 
-def plot_latency_vs_scenario(aggregates: dict, output_dir: Path):
-    scenarios_order = [
+def render_latency_trends(summary_matrix: dict, target_dir: Path):
+    target_scenarios = [
         "NONE_0f",
         "OFFLINE_1f",
         "MALICIOUS_BYZANTINE_1f",
         "OFFLINE_2f",
         "MALICIOUS_BYZANTINE_2f",
     ]
-    scenario_labels = [
+    axis_labels = [
         "Baseline\n(0 Faults)",
         "1 Crash\n(Offline)",
         "1 Byzantine\n(Active)",
@@ -76,72 +81,70 @@ def plot_latency_vs_scenario(aggregates: dict, output_dir: Path):
         "2 Byzantine\n(Active)",
     ]
 
-    batch_sizes = sorted(set(k[1] for k in aggregates))
-    colors = ["#2196F3", "#FF9800", "#4CAF50"]
+    all_batch_sizes = sorted(set(key[1] for key in summary_matrix))
+    palette = ["#2196F3", "#FF9800", "#4CAF50"]
     markers = ["o", "s", "^"]
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, canvas = plt.subplots(figsize=(10, 6))
 
-    for bi, bs in enumerate(batch_sizes):
-        lats = []
-        for sc in scenarios_order:
-            key = (sc, bs)
-            if key in aggregates:
-                lats.append(aggregates[key]["avg_latency_ms"])
-            else:
-                lats.append(0)
-        ax.plot(
-            range(len(scenarios_order)),
-            lats,
-            label=f"Batch={bs}",
-            color=colors[bi % len(colors)],
-            marker=markers[bi % len(markers)],
+    for idx, size in enumerate(all_batch_sizes):
+        trend_line = []
+        for stage in target_scenarios:
+            lookup = (stage, size)
+            lat_val = summary_matrix[lookup]["avg_latency_ms"] if lookup in summary_matrix else 0.0
+            trend_line.append(lat_val)
+            
+        canvas.plot(
+            range(len(target_scenarios)),
+            trend_line,
+            label=f"Batch={size}",
+            color=palette[idx % len(palette)],
+            marker=markers[idx % len(markers)],
             linewidth=2,
             markersize=8,
         )
 
-    ax.set_xticks(range(len(scenarios_order)))
-    ax.set_xticklabels(scenario_labels, fontsize=10)
-    ax.set_xlabel("Fault Scenario", fontsize=12, labelpad=10)
-    ax.set_ylabel("Average Consensus Latency (ms)", fontsize=12, labelpad=10)
-    ax.set_title("Consensus Latency Under Fault Scenarios", fontsize=14, pad=15)
-    ax.legend(title="Transaction Batch Size", fontsize=10, title_fontsize=11)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.set_axisbelow(True)
+    canvas.set_xticks(range(len(target_scenarios)))
+    canvas.set_xticklabels(axis_labels, fontsize=10)
+    canvas.set_xlabel("Fault Scenario", fontsize=12, labelpad=10)
+    canvas.set_ylabel("Average Consensus Latency (ms)", fontsize=12, labelpad=10)
+    canvas.set_title("Consensus Latency Under Fault Scenarios", fontsize=14, pad=15)
+    canvas.legend(title="Transaction Batch Size", fontsize=10, title_fontsize=11)
+    canvas.grid(True, linestyle="--", alpha=0.6)
+    canvas.set_axisbelow(True)
 
-    for bi, bs in enumerate(batch_sizes):
-        for si, sc in enumerate(scenarios_order):
-            key = (sc, bs)
-            if key in aggregates:
-                val = aggregates[key]["avg_latency_ms"]
-                if val > 0:
-                    ax.annotate(
-                        f"{val:.0f}",
-                        (si, val),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha="center",
-                        fontsize=8,
-                        color=colors[bi % len(colors)],
-                    )
+    for idx, size in enumerate(all_batch_sizes):
+        for s_idx, stage in enumerate(target_scenarios):
+            lookup = (stage, size)
+            if lookup not in summary_matrix:
+                continue
+            val = summary_matrix[lookup]["avg_latency_ms"]
+            if val <= 0:
+                continue
+            canvas.annotate(
+                f"{val:.0f}",
+                (s_idx, val),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha="center",
+                fontsize=8,
+                color=palette[idx % len(palette)],
+            )
 
     plt.tight_layout()
-    path = output_dir / "latency_vs_scenario.pdf"
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    fig.savefig(output_dir / "latency_vs_scenario.png", dpi=200, bbox_inches="tight")
+    fig.savefig(target_dir / "latency_vs_scenario.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved {path}")
 
 
-def plot_throughput_bar_chart(aggregates: dict, output_dir: Path):
-    scenarios_order = [
+def render_throughput_bars(summary_matrix: dict, target_dir: Path):
+    target_scenarios = [
         "NONE_0f",
         "OFFLINE_1f",
         "MALICIOUS_BYZANTINE_1f",
         "OFFLINE_2f",
         "MALICIOUS_BYZANTINE_2f",
     ]
-    scenario_labels = [
+    axis_labels = [
         "Baseline\n(0 Faults)",
         "1 Crash\n(Offline)",
         "1 Byzantine\n(Active)",
@@ -149,152 +152,134 @@ def plot_throughput_bar_chart(aggregates: dict, output_dir: Path):
         "2 Byzantine\n(Active)",
     ]
 
-    batch_sizes = sorted(set(k[1] for k in aggregates))
-    n_scenarios = len(scenarios_order)
-    n_batches = len(batch_sizes)
+    all_batch_sizes = sorted(set(key[1] for key in summary_matrix))
+    total_scenarios = len(target_scenarios)
+    total_batches = len(all_batch_sizes)
 
-    bar_width = 0.8 / n_batches
-    x = np.arange(n_scenarios)
+    segment_width = 0.8 / total_batches
+    x_coords = np.arange(total_scenarios)
+    palette = ["#2196F3", "#FF9800", "#4CAF50"]
 
-    colors = ["#2196F3", "#FF9800", "#4CAF50"]
+    fig, canvas = plt.subplots(figsize=(10, 6))
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    for bi, bs in enumerate(batch_sizes):
-        tps_vals = []
-        for sc in scenarios_order:
-            key = (sc, bs)
-            if key in aggregates:
-                tps_vals.append(aggregates[key]["throughput_tps"])
-            else:
-                tps_vals.append(0)
-        offset = (bi - n_batches / 2 + 0.5) * bar_width
-        bars = ax.bar(
-            x + offset,
-            tps_vals,
-            bar_width,
-            label=f"Batch={bs}",
-            color=colors[bi % len(colors)],
+    for idx, size in enumerate(all_batch_sizes):
+        tps_metrics = []
+        for stage in target_scenarios:
+            lookup = (stage, size)
+            tps_val = summary_matrix[lookup]["throughput_tps"] if lookup in summary_matrix else 0.0
+            tps_metrics.append(tps_val)
+            
+        offset = (idx - total_batches / 2 + 0.5) * segment_width
+        bars = canvas.bar(
+            x_coords + offset,
+            tps_metrics,
+            segment_width,
+            label=f"Batch={size}",
+            color=palette[idx % len(palette)],
             edgecolor="white",
             linewidth=0.5,
         )
-        for bar, val in zip(bars, tps_vals):
-            if val > 0:
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(tps_vals) * 0.02,
-                    f"{val:.0f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    rotation=45,
-                )
+        
+        # Avoid exploding layout with zero labels or flat charts
+        max_height = max(tps_metrics) if tps_metrics else 1.0
+        for block in bars:
+            height = block.get_height()
+            if height <= 0:
+                continue
+            canvas.text(
+                block.get_x() + block.get_width() / 2,
+                height + (max_height * 0.02),
+                f"{height:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=45,
+            )
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(scenario_labels, fontsize=10)
-    ax.set_xlabel("Fault Scenario", fontsize=12, labelpad=10)
-    ax.set_ylabel("Throughput (TPS)", fontsize=12, labelpad=10)
-    ax.set_title("Network Throughput Under Fault Scenarios", fontsize=14, pad=15)
-    ax.legend(title="Transaction Batch Size", fontsize=10, title_fontsize=11)
-    ax.grid(True, axis="y", linestyle="--", alpha=0.6)
-    ax.set_axisbelow(True)
+    canvas.set_xticks(x_coords)
+    canvas.set_xticklabels(axis_labels, fontsize=10)
+    canvas.set_xlabel("Fault Scenario", fontsize=12, labelpad=10)
+    canvas.set_ylabel("Throughput (TPS)", fontsize=12, labelpad=10)
+    canvas.set_title("Network Throughput Under Fault Scenarios", fontsize=14, pad=15)
+    canvas.legend(title="Transaction Batch Size", fontsize=10, title_fontsize=11)
+    canvas.grid(True, axis="y", linestyle="--", alpha=0.6)
+    canvas.set_axisbelow(True)
 
     plt.tight_layout()
-    path = output_dir / "throughput_vs_scenario.pdf"
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    fig.savefig(output_dir / "throughput_vs_scenario.png", dpi=200, bbox_inches="tight")
+    fig.savefig(target_dir / "throughput_vs_scenario.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved {path}")
 
 
-def plot_latency_cdf(rows: list[dict], output_dir: Path):
-    scenarios = sorted(set(r["fault_scenario"] for r in rows))
-    colors = ["#2196F3", "#FF9800", "#4CAF50", "#F44336", "#9C27B0"]
-    linestyles = ["-", "--", "-.", ":", "-"]
+def render_latency_cdf(records: list[dict], target_dir: Path):
+    distinct_scenarios = sorted(set(entry["fault_scenario"] for entry in records))
+    palette = ["#2196F3", "#FF9800", "#4CAF50", "#F44336", "#9C27B0"]
+    styles = ["-", "--", "-.", ":", "-"]
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, canvas = plt.subplots(figsize=(10, 6))
 
-    for si, sc in enumerate(scenarios):
-        lats = [
-            float(r["latency_ms"])
-            for r in rows
-            if r["fault_scenario"] == sc and r["status"] == "OK"
+    for idx, stage in enumerate(distinct_scenarios):
+        raw_latencies = [
+            float(entry["latency_ms"])
+            for entry in records
+            if entry["fault_scenario"] == stage and entry["status"] == "OK"
         ]
-        if not lats:
+        if not raw_latencies:
             continue
-        lats.sort()
-        n = len(lats)
-        y = np.arange(1, n + 1) / n
+            
+        raw_latencies.sort()
+        total_points = len(raw_latencies)
+        probabilities = np.arange(1, total_points + 1) / total_points
 
-        label_map = {
+        aliases = {
             "NONE_0f": "Baseline (0 Faults)",
             "OFFLINE_1f": "1 Crash (Offline)",
             "MALICIOUS_BYZANTINE_1f": "1 Byzantine",
             "OFFLINE_2f": "2 Crash (Offline)",
             "MALICIOUS_BYZANTINE_2f": "2 Byzantine",
         }
-        ax.plot(
-            lats,
-            y,
-            label=label_map.get(sc, sc),
-            color=colors[si % len(colors)],
-            linestyle=linestyles[si % len(linestyles)],
+        
+        canvas.plot(
+            raw_latencies,
+            probabilities,
+            label=aliases.get(stage, stage),
+            color=palette[idx % len(palette)],
+            linestyle=styles[idx % len(styles)],
             linewidth=2,
         )
 
-    ax.set_xlabel("Consensus Latency (ms)", fontsize=12, labelpad=10)
-    ax.set_ylabel("Cumulative Probability", fontsize=12, labelpad=10)
-    ax.set_title("Latency CDF by Fault Scenario", fontsize=14, pad=15)
-    ax.legend(fontsize=10)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.set_axisbelow(True)
+    canvas.set_xlabel("Consensus Latency (ms)", fontsize=12, labelpad=10)
+    canvas.set_ylabel("Cumulative Probability", fontsize=12, labelpad=10)
+    canvas.set_title("Latency CDF by Fault Scenario", fontsize=14, pad=15)
+    canvas.legend(fontsize=10)
+    canvas.grid(True, linestyle="--", alpha=0.6)
+    canvas.set_axisbelow(True)
 
     plt.tight_layout()
-    path = output_dir / "latency_cdf.pdf"
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    fig.savefig(output_dir / "latency_cdf.png", dpi=200, bbox_inches="tight")
+    fig.savefig(target_dir / "latency_cdf.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved {path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Plot AgentConsensus benchmark results"
-    )
-    parser.add_argument(
-        "--input", type=str, default=str(RESULTS_CSV),
-        help=f"Path to results CSV (default: {RESULTS_CSV})"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default=str(OUTPUT_DIR),
-        help=f"Output directory for charts (default: {OUTPUT_DIR})"
-    )
+    parser = argparse.ArgumentParser(description="Plot AgentConsensus benchmark results")
+    parser.add_argument("--input", type=str, default=str(METRICS_CSV))
+    parser.add_argument("--output-dir", type=str, default=str(CHART_OUT_DIR))
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    source_csv = Path(args.input)
+    target_plots_dir = Path(args.output_dir)
+    target_plots_dir.mkdir(parents=True, exist_ok=True)
 
-    if not input_path.exists():
-        print(f"Error: results file not found: {input_path}")
-        print("Run benchmarks/profiler.py first to generate results.")
+    if not source_csv.exists():
+        print(f"Metrics missing: {source_csv}. Run the performance profiler first.")
         sys.exit(1)
 
-    print(f"Loading results from {input_path} ...")
-    rows = load_results(str(input_path))
-    print(f"  Loaded {len(rows)} rows")
+    records = parse_metrics_file(source_csv)
+    summary_matrix = roll_up_benchmarks(records)
 
-    aggregates = compute_aggregates(rows)
-    print(f"  Aggregated {len(aggregates)} scenario/batch groups")
-
-    print("\nGenerating charts ...")
-    plot_latency_vs_scenario(aggregates, output_dir)
-    plot_throughput_bar_chart(aggregates, output_dir)
-    plot_latency_cdf(rows, output_dir)
-
-    print(f"\nAll charts saved to {output_dir}/")
+    render_latency_trends(summary_matrix, target_plots_dir)
+    render_throughput_bars(summary_matrix, target_plots_dir)
+    render_latency_cdf(records, target_plots_dir)
 
 
 if __name__ == "__main__":
-    import sys
     main()

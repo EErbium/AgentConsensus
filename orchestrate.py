@@ -3,231 +3,207 @@ import json
 import os
 import binascii
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
 import docker
+import httpx
+import time
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
-NETWORK_NAME = "agent_consensus_net"
-IMAGE_NAME = "agent-consensus-node"
-SUBNET = "172.28.0.0/16"
-GATEWAY = "172.28.0.1"
-BASE_IP = "172.28.0."
-START_OCTET = 10
-TOPOLOGY_PATH = os.path.abspath("topology.json")
-KEYS_PATH = os.path.abspath("keys.json")
+sys.stdout.reconfigure(encoding='utf-8')
 
+NET_NAME = "agent_consensus_net"
+IMG_TAG = "agent-consensus-node"
+SUBNET_CIDR = "172.28.0.0/16"
+NET_GW = "172.28.0.1"
+IP_PREFIX = "172.28.0."
+STARTING_IP_OCTET = 10
 
-def get_client():
-    return docker.from_env()
-
-
-def generate_topology(num_nodes: int):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-        Ed25519PrivateKey,
-    )
-    print(f"Generating {num_nodes} Ed25519 key pairs ...")
-    nodes_pub: dict[str, dict[str, str]] = {}
-    private_keys: dict[str, str] = {}
-    for i in range(1, num_nodes + 1):
-        name = f"node_{i}"
-        pk = Ed25519PrivateKey.generate()
-        priv_hex = binascii.hexlify(pk.private_bytes_raw()).decode()
-        pub_hex = binascii.hexlify(pk.public_key().public_bytes_raw()).decode()
-        nodes_pub[name] = {"public_key": pub_hex}
-        private_keys[name] = priv_hex
-
-    topology = {"nodes": nodes_pub}
-    with open(TOPOLOGY_PATH, "w") as f:
-        json.dump(topology, f, indent=2)
-    with open(KEYS_PATH, "w") as f:
-        json.dump(private_keys, f, indent=2)
-
-    print(f"  Wrote {TOPOLOGY_PATH}")
-    print(f"  Wrote {KEYS_PATH}")
-    return topology, private_keys
+TOPOLOGY_FILE = os.path.abspath("topology.json")
+KEYS_FILE = os.path.abspath("keys.json")
 
 
-def load_or_generate_topology(num_nodes: int):
-    if os.path.exists(TOPOLOGY_PATH) and os.path.exists(KEYS_PATH):
-        with open(TOPOLOGY_PATH) as f:
-            topology = json.load(f)
-        with open(KEYS_PATH) as f:
-            private_keys = json.load(f)
-        if (
-            len(topology.get("nodes", {})) == num_nodes
-            and len(private_keys) == num_nodes
-        ):
-            print("Reusing existing topology.json and keys.json")
-            return topology, private_keys
-        print("Node count changed; regenerating topology.")
-
-    return generate_topology(num_nodes)
-
-
-def ensure_network(client):
+def init_docker():
     try:
-        net = client.networks.get(NETWORK_NAME)
-        print(f"Network '{NETWORK_NAME}' already exists, reusing.")
-        return net
+        return docker.from_env()
+    except Exception as e:
+        print(f"Failed to connect to Docker daemon: {e}")
+        sys.exit(1)
+
+
+def sync_topology(node_count: int):
+    if os.path.exists(TOPOLOGY_FILE) and os.path.exists(KEYS_FILE):
+        with open(TOPOLOGY_FILE) as f:
+            cluster_map = json.load(f)
+        with open(KEYS_FILE) as f:
+            secret_keys = json.load(f)
+        
+        if len(cluster_map.get("nodes", {})) == node_count and len(secret_keys) == node_count:
+            return cluster_map, secret_keys
+
+    print(f"Generating key pairs for {node_count} consensus nodes...")
+    public_registry = {}
+    secret_registry = {}
+    
+    for idx in range(1, node_count + 1):
+        node_name = f"node_{idx}"
+        signing_key = ed25519.Ed25519PrivateKey.generate()
+        
+        raw_seed = signing_key.private_bytes_raw()
+        raw_pub = signing_key.public_key().public_bytes_raw()
+        
+        secret_registry[node_name] = binascii.hexlify(raw_seed).decode()
+        public_registry[node_name] = {"public_key": binascii.hexlify(raw_pub).decode()}
+
+    cluster_map = {"nodes": public_registry}
+    
+    with open(TOPOLOGY_FILE, "w") as f:
+        json.dump(cluster_map, f, indent=2)
+    with open(KEYS_FILE, "w") as f:
+        json.dump(secret_registry, f, indent=2)
+
+    return cluster_map, secret_registry
+
+
+def setup_overlay_net(engine):
+    try:
+        return engine.networks.get(NET_NAME)
     except docker.errors.NotFound:
-        print(f"Creating bridge network '{NETWORK_NAME}' ...")
-        return client.networks.create(
-            NETWORK_NAME,
-            driver="bridge",
-            ipam=docker.types.IPAMConfig(
-                pool_configs=[
-                    docker.types.IPAMPool(subnet=SUBNET, gateway=GATEWAY)
-                ]
-            ),
-        )
+        pass
+
+    ipam_pool = docker.types.IPAMPool(subnet=SUBNET_CIDR, gateway=NET_GW)
+    ipam_cfg = docker.types.IPAMConfig(pool_configs=[ipam_pool])
+    return engine.networks.create(NET_NAME, driver="bridge", ipam=ipam_cfg)
 
 
-def build_image(client):
-    print(f"Building image '{IMAGE_NAME}' ...")
-    img, logs = client.images.build(path=".", tag=IMAGE_NAME, rm=True)
-    for line in logs:
-        stream = line.get("stream")
-        if stream:
-            print(stream, end="")
-    print(f"Image built: {img.short_id}")
-    return img
+def compile_node_image(engine):
+    print(f"Building {IMG_TAG} from local context...")
+    image, build_logs = engine.images.build(path=".", tag=IMG_TAG, rm=True)
+    for log_line in build_logs:
+        chunk = log_line.get("stream")
+        if chunk:
+            print(chunk, end="")
+    return image
 
 
-def launch_containers(client, network, count, private_keys):
-    containers = []
-    for i in range(1, count + 1):
-        name = f"node_{i}"
+def deploy_cluster(engine, subnet, node_count, secret_keys):
+    active_instances = []
+    
+    for idx in range(1, node_count + 1):
+        node_name = f"node_{idx}"
+        
         try:
-            old = client.containers.get(name)
-            if old.status == "running":
-                print(f"  {name} already running, skipping.")
-                containers.append(old)
-                continue
-            print(f"  Removing stale container {name} ...")
-            old.remove(force=True)
+            stale = engine.containers.get(node_name)
+            stale.remove(force=True)
         except docker.errors.NotFound:
             pass
 
-        ip = f"{BASE_IP}{START_OCTET + i - 1}"
-        peers = [
-            f"node_{j}" for j in range(1, count + 1) if j != i
-        ]
+        node_ip = f"{IP_PREFIX}{STARTING_IP_OCTET + idx - 1}"
+        peer_identifiers = [f"node_{j}" for j in range(1, node_count + 1) if j != idx]
 
-        print(f"  Launching {name} @ {ip} ...")
-        c = client.containers.run(
-            IMAGE_NAME,
-            name=name,
+        # The Docker API requires attaching to custom networks via network configuration mappings 
+        # during creation if we want static IPs to stick correctly without race conditions.
+        endpoint_config = {
+            NET_NAME: docker.types.EndpointConfig(
+                ipv4_address=node_ip
+            )
+        }
+        network_mode_param = NET_NAME
+
+        instance = engine.containers.run(
+            IMG_TAG,
+            name=node_name,
             detach=True,
-            remove=True,
             environment={
-                "NODE_ID": name,
-                "PEERS": ",".join(peers),
-                "PRIVATE_KEY_HEX": private_keys[name],
+                "NODE_ID": node_name,
+                "PEERS": ",".join(peer_identifiers),
+                "PRIVATE_KEY_HEX": secret_keys[node_name],
             },
-            ports={"8000/tcp": ("0.0.0.0", 8000 + i - 1)},
+            ports={"8000/tcp": ("0.0.0.0", 8000 + idx - 1)},
             volumes={
-                TOPOLOGY_PATH: {
+                TOPOLOGY_FILE: {
                     "bind": "/app/topology.json",
                     "mode": "ro",
                 }
             },
+            network=network_mode_param,
+            networking_config=docker.types.NetworkingConfig(endpoints=endpoint_config)
         )
-        network.connect(c, ipv4_address=ip)
-        c.reload()
-        containers.append(c)
+        
+        instance.reload()
+        active_instances.append(instance)
 
-    return containers
+    return active_instances
 
 
-def wait_for_ready(containers):
-    import httpx
-    import time
-
-    for c in containers:
-        port = c.attrs["NetworkSettings"]["Ports"]["8000/tcp"][0]["HostPort"]
-        url = f"http://127.0.0.1:{port}/health"
-        for attempt in range(15):
+def verify_cluster_health(instances):
+    print("\nVerifying HTTP health endpoints...")
+    for instance in instances:
+        bindings = instance.attrs["NetworkSettings"]["Ports"]["8000/tcp"]
+        if not bindings:
+            print(f"  WARNING: No port bindings found for {instance.name}")
+            continue
+            
+        host_port = bindings[0]["HostPort"]
+        endpoint = f"http://127.0.0.1:{host_port}/health"
+        
+        healthy = False
+        for _ in range(15):
             try:
-                r = httpx.get(url, timeout=2)
-                if r.status_code == 200:
-                    print(f"  {c.name} ready at {url}")
+                resp = httpx.get(endpoint, timeout=1.0)
+                if resp.status_code == 200:
+                    print(f"  {instance.name} is alive at {endpoint}")
+                    healthy = True
                     break
             except Exception:
                 pass
             time.sleep(1)
-        else:
-            print(f"  WARNING: {c.name} did not respond in time")
+            
+        if not healthy:
+            print(f"  CRITICAL: {instance.name} failed to respond to health checks.")
 
 
-def destroy_all(client, clean_files=False):
-    print("Tearing down all agent-consensus containers and network ...")
-    for c in client.containers.list(
-        filters={"network": NETWORK_NAME}, all=True
-    ):
-        print(f"  Removing container {c.name} ...")
-        c.remove(force=True)
+def purge_environment(engine, drop_configs=False):
+    for instance in engine.containers.list(all=True):
+        if instance.name.startswith("node_"):
+            print(f"Stopping and dropping container: {instance.name}")
+            instance.remove(force=True)
+            
     try:
-        net = client.networks.get(NETWORK_NAME)
-        net.remove()
-        print(f"  Removed network '{NETWORK_NAME}'.")
+        subnet = engine.networks.get(NET_NAME)
+        subnet.remove()
+        print(f"Dropped network: {NET_NAME}")
     except docker.errors.NotFound:
         pass
 
-    if clean_files:
-        for p in (TOPOLOGY_PATH, KEYS_PATH):
-            if os.path.exists(p):
-                os.remove(p)
-                print(f"  Removed {p}")
+    if not drop_configs:
+        return
 
-    print("Done.")
+    for target_path in (TOPOLOGY_FILE, KEYS_FILE):
+        if os.path.exists(target_path):
+            os.remove(target_path)
+            print(f"Purged: {target_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Orchestrate AgentConsensus FastAPI nodes on Docker."
-    )
-    parser.add_argument(
-        "action",
-        nargs="?",
-        default="up",
-        choices=["up", "down"],
-        help="'up' (default) to spin up, 'down' to tear down",
-    )
-    parser.add_argument(
-        "-n",
-        "--nodes",
-        type=int,
-        default=3,
-        help="Number of nodes to launch (default: 3)",
-    )
-    parser.add_argument(
-        "--clean",
-        action="store_true",
-        help="Also remove topology.json and keys.json on 'down'",
-    )
-    args = parser.parse_args()
+    cli = argparse.ArgumentParser(description="Consensus cluster orchestrator.")
+    cli.add_argument("action", nargs="?", default="up", choices=["up", "down"])
+    cli.add_argument("-n", "--nodes", type=int, default=3, help="Total target consensus nodes")
+    cli.add_argument("--clean", action="store_true", help="Wipe configurations on teardown")
+    args = cli.parse_args()
 
-    client = get_client()
+    engine = init_docker()
 
     if args.action == "down":
-        destroy_all(client, clean_files=args.clean)
+        purge_environment(engine, drop_configs=args.clean)
         return
 
-    topology, private_keys = load_or_generate_topology(args.nodes)
-    network = ensure_network(client)
-    build_image(client)
-    containers = launch_containers(client, network, args.nodes, private_keys)
-    print(f"\n{len(containers)} node(s) launched. Waiting for readiness ...")
-    wait_for_ready(containers)
+    cluster_map, secret_keys = sync_topology(args.nodes)
+    subnet = setup_overlay_net(engine)
+    compile_node_image(engine)
+    
+    instances = deploy_cluster(engine, subnet, args.nodes, secret_keys)
+    verify_cluster_health(instances)
 
-    print("\n--- Summary ---")
-    for c in containers:
-        port = c.attrs["NetworkSettings"]["Ports"]["8000/tcp"][0]["HostPort"]
-        print(f"  {c.name}: http://127.0.0.1:{port}/health")
-        print(f"          http://127.0.0.1:{port}/ledger")
-        print(f"          POST http://127.0.0.1:{port}/transaction")
-    print(f"  Internal DNS: node_1, node_2, ... inside '{NETWORK_NAME}'")
-    print("Done.")
-
-
-if __name__ == "__main__":
-    main()
+    print("\n--- Network Matrix ---")
+    for instance in instances:
+        host_port = instance.attrs["NetworkSettings"]["Ports"]["8000/tcp"][0]["HostPort"]
+        print(f"  {instance.name} -> http://127.0.0.1:{host_port} [Internal DNS accessible within {NET_NAME}]")
