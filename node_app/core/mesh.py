@@ -1,6 +1,5 @@
 import asyncio
 import httpx
-
 from node_app.core.crypto import sign_payload
 
 PHASE_PREPARE = "PREPARE"
@@ -10,37 +9,37 @@ PHASE_COMMIT = "COMMIT"
 def build_signed_message(
     private_key_hex: str,
     tx_id: str,
-    seq: int,
-    phase: str,
-    validator: str,
+    sequence_num: int,
+    consensus_phase: str,
+    validator_identity: str,
 ) -> dict:
-    msg = f"{tx_id}{seq}{phase}".encode()
-    signature = sign_payload(private_key_hex, msg)
+    wire_payload = f"{tx_id}{sequence_num}{consensus_phase}".encode()
+    cryptographic_signature = sign_payload(private_key_hex, wire_payload)
     return {
         "tx_id": tx_id,
-        "sequence_number": seq,
-        "validator": validator,
-        "signature": signature,
+        "sequence_number": sequence_num,
+        "validator": validator_identity,
+        "signature": cryptographic_signature,
     }
 
 
 async def broadcast_to_peers(
     peers: list[str],
-    endpoint: str,
-    payload: dict,
+    endpoint_path: str,
+    serialized_message: dict,
 ) -> list[Exception | httpx.Response | None]:
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(2.0),
-    ) as client:
-        results = []
-        for peer in peers:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as http_client:
+        delivery_outcomes = []
+        for target_node in peers:
             try:
-                r = await client.post(
-                    f"http://{peer}:8000{endpoint}", json=payload
+                network_response = await http_client.post(
+                    f"http://{target_node}:8000{endpoint_path}", json=serialized_message
                 )
-                results.append(r)
+                delivery_outcomes.append(network_response)
             except httpx.HTTPError:
-                results.append(None)
-            # Cooperatively yield to let the event loop process incoming packets
+                delivery_outcomes.append(None)
+            
+            # Cooperative yield to prevent event loop starvation during concurrent message bursts
             await asyncio.sleep(0.001)
-        return results
+            
+        return delivery_outcomes

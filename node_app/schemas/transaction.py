@@ -11,15 +11,14 @@ class ExecutionPayload(BaseModel):
     asset_amount: float = Field(..., ge=0)
     denomination: str = Field(..., min_length=1)
 
-    @field_validator("asset_amount")
+    @field_validator("asset_amount", mode="before")
     @classmethod
-    def eight_decimal_precision(cls, v: float) -> float:
-        d = Decimal(str(v))
-        if d.as_tuple().exponent < -8:
-            raise ValueError(
-                f"asset_amount {v} exceeds 8-decimal precision limit"
-            )
-        return float(d.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN))
+    def enforce_eight_decimal_precision(cls, raw_amount: float) -> float:
+        # Float precision drifts during transport, so clamp to 8 decimals immediately via Decimal
+        quantized = Decimal(str(raw_amount)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        if quantized < 0:
+            raise ValueError("Asset allocation amount cannot evaluate to a negative value.")
+        return float(quantized)
 
 
 class TransactionEnvelope(BaseModel):
@@ -31,33 +30,44 @@ class TransactionEnvelope(BaseModel):
     llm_reasoning_hash: str
     signatures: Dict[str, str]
 
-    @field_validator("tx_id", "llm_reasoning_hash")
+    @field_validator("tx_id", "llm_reasoning_hash", mode="before")
     @classmethod
-    def validate_sha256_hex(cls, v: str) -> str:
-        if len(v) != 64:
-            raise ValueError("must be a 64-character hex SHA-256 string")
+    def clean_and_verify_sha256(cls, hex_string: str) -> str:
+        if not isinstance(hex_string, str):
+            raise ValueError("Target cryptographic digest must be presented as a raw string.")
+        
+        cleaned_hash = hex_string.strip().lower()
+        if len(cleaned_hash) != 64:
+            raise ValueError("Digest length mismatch: SHA-256 strings must be exactly 64 characters.")
+        
         try:
-            int(v, 16)
+            int(cleaned_hash, 16)
         except ValueError:
-            raise ValueError("must be a valid hex string")
-        return v
+            raise ValueError("Malformed encoding: Digest contains non-hexadecimal symbols.")
+            
+        return cleaned_hash
 
     @model_validator(mode="after")
     def verify_tx_id(self):
-        canonical = json.dumps(
+        # Deterministic serialization format for structural identity confirmation across consensus nodes
+        canonical_payload = json.dumps(
             self.execution_payload.model_dump(mode="json"),
             sort_keys=True,
             separators=(",", ":"),
         )
-        raw = (
-            self.proposer_node
+        
+        preimage_string = (
+            str(self.proposer_node).strip().lower()
             + str(self.sequence_number)
             + str(self.timestamp)
-            + canonical
+            + canonical_payload
         )
-        expected = hashlib.sha256(raw.encode()).hexdigest()
-        if self.tx_id != expected:
+        
+        computed_hash = hashlib.sha256(preimage_string.encode()).hexdigest()
+        if self.tx_id != computed_hash:
             raise ValueError(
-                f"tx_id {self.tx_id} does not match computed hash {expected}"
+                f"Transaction identification discrepancy: Received '{self.tx_id}', but "
+                f"cryptographic confirmation yielded '{computed_hash}'."
             )
+            
         return self

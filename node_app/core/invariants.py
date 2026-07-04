@@ -1,8 +1,8 @@
 import time
 from node_app.schemas.transaction import ExecutionPayload
 
-MAX_ALLOCATE_AMOUNT = 1000.00000000
-MAX_TIMESTAMP_DRIFT_SECONDS = 60
+MAX_ALLOCATION_LIMIT = 1000.00000000
+MAX_CLOCK_DRIFT_SECONDS = 60
 
 
 class InvariantViolation(Exception):
@@ -14,37 +14,45 @@ class InvariantViolation(Exception):
 
 
 def check_fund_allocation_threshold(payload: ExecutionPayload) -> None:
-    if payload.action == "ALLOCATE_FUNDS" and payload.asset_amount > MAX_ALLOCATE_AMOUNT:
-        raise InvariantViolation(
-            f"ALLOCATE_FUNDS amount {payload.asset_amount} exceeds "
-            f"maximum {MAX_ALLOCATE_AMOUNT}",
-            field_path="execution_payload.asset_amount",
-            error_type="invariant.allocation_threshold",
-        )
+    if payload.action != "ALLOCATE_FUNDS":
+        return
+        
+    if payload.asset_amount <= MAX_ALLOCATION_LIMIT:
+        return
+
+    raise InvariantViolation(
+        f"ALLOCATE_FUNDS amount {payload.asset_amount} exceeds maximum allowed limit of {MAX_ALLOCATION_LIMIT}",
+        field_path="execution_payload.asset_amount",
+        error_type="invariant.allocation_threshold",
+    )
 
 
-def check_timestamp_replay(timestamp: int) -> None:
-    drift = abs(time.time() - timestamp)
-    if drift > MAX_TIMESTAMP_DRIFT_SECONDS:
-        raise InvariantViolation(
-            f"Timestamp {timestamp} drifts {drift:.0f}s from system clock "
-            f"(max {MAX_TIMESTAMP_DRIFT_SECONDS}s)",
-            field_path="timestamp",
-            error_type="invariant.timestamp_drift",
-        )
+def check_timestamp_replay(packet_timestamp: int) -> None:
+    clock_skew = abs(time.time() - packet_timestamp)
+    if clock_skew <= MAX_CLOCK_DRIFT_SECONDS:
+        return
+
+    raise InvariantViolation(
+        f"Timestamp {packet_timestamp} drifts {clock_skew:.0f}s from node system clock (max permitted {MAX_CLOCK_DRIFT_SECONDS}s)",
+        field_path="timestamp",
+        error_type="invariant.timestamp_drift",
+    )
 
 
 def validate_all(
     execution_payload: ExecutionPayload,
-    timestamp: int,
+    packet_timestamp: int,
 ) -> list[InvariantViolation]:
-    violations: list[InvariantViolation] = []
+    active_violations: list[InvariantViolation] = []
+    
     try:
         check_fund_allocation_threshold(execution_payload)
-    except InvariantViolation as e:
-        violations.append(e)
+    except InvariantViolation as threshold_error:
+        active_violations.append(threshold_error)
+        
     try:
-        check_timestamp_replay(timestamp)
-    except InvariantViolation as e:
-        violations.append(e)
-    return violations
+        check_timestamp_replay(packet_timestamp)
+    except InvariantViolation as replay_error:
+        active_violations.append(replay_error)
+        
+    return active_violations

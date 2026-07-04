@@ -55,22 +55,34 @@ async def set_fault(cfg: FaultConfig, request: Request):
     state.fault_mode = cfg.mode
     state._fault_config = cfg.model_dump()
 
-    if cfg.mode == FAULT_BYZANTINE:
-        original = state._original_peers
-        if cfg.byzantine_targets:
-            targets = [p for p in cfg.byzantine_targets if p in original]
-            state.peers = [p for p in original if p not in targets]
-            state._byzantine_drop = targets
-        else:
-            mid = len(original) // 2
-            state.peers = original[:mid]
-            state._byzantine_drop = original[mid:]
-        n = len(original)
-        f = (n - 1) // 3
-        if len(state.peers) < f + 1:
-            needed = f + 1 - len(state.peers)
-            state.peers.extend(state._byzantine_drop[:needed])
-            state._byzantine_drop = state._byzantine_drop[needed:]
+    if cfg.mode != FAULT_BYZANTINE:
+        return {
+            "status": "ok",
+            "mode": cfg.mode,
+            "active_peers": state.peers,
+            "dropped_peers": state._byzantine_drop,
+        }
+
+    # Handle Byzantine mode partitioning logic cleanly
+    original_cluster = state._original_peers
+    if cfg.byzantine_targets:
+        targets = [p for p in cfg.byzantine_targets if p in original_cluster]
+        state.peers = [p for p in original_cluster if p not in targets]
+        state._byzantine_drop = targets
+    else:
+        midpoint = len(original_cluster) // 2
+        state.peers = original_cluster[:midpoint]
+        state._byzantine_drop = original_cluster[midpoint:]
+
+    # Enforce minimum consensus group size requirements (f + 1 nodes minimum)
+    total_nodes = len(original_cluster)
+    max_faulty = (total_nodes - 1) // 3
+    required_min = max_faulty + 1
+
+    if len(state.peers) < required_min:
+        shortfall = required_min - len(state.peers)
+        state.peers.extend(state._byzantine_drop[:shortfall])
+        state._byzantine_drop = state._byzantine_drop[shortfall:]
 
     return {
         "status": "ok",
@@ -96,7 +108,7 @@ class ChaosMiddleware(BaseHTTPMiddleware):
         state = request.app.state
         fault_mode = getattr(state, "fault_mode", FAULT_NONE)
 
-        if any(request.url.path.startswith(p) for p in EXEMPT_PREFIXES):
+        if any(request.url.path.startswith(prefix) for prefix in EXEMPT_PREFIXES):
             return await call_next(request)
 
         if fault_mode == FAULT_OFFLINE:
@@ -111,56 +123,69 @@ class ChaosMiddleware(BaseHTTPMiddleware):
                 },
             )
 
+        # Starlette middleware stream reading work-around to prevent hanging downstream endpoints
+        body_bytes = b""
         if fault_mode == FAULT_BYZANTINE and request.method == "POST":
             body_bytes = await request.body()
-            response = await call_next(request)
-            if response.status_code in (200, 201, 202):
-                drop_peers = getattr(state, "_byzantine_drop", [])
-                if drop_peers:
-                    try:
-                        data = json.loads(body_bytes)
-                        tx_id = data.get("tx_id", "")
-                        seq = data.get("sequence_number", 0)
-                        path = request.url.path
-                        asyncio.ensure_future(
-                            _send_corrupted_broadcast(
-                                state, drop_peers, path, tx_id, seq
-                            )
-                        )
-                    except Exception as exc:
-                        logger.warning("Byzantine corruption failed: %s", exc)
+            async def receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            request._receive = receive
+
+        response = await call_next(request)
+
+        if fault_mode != FAULT_BYZANTINE or request.method != "POST":
             return response
 
-        return await call_next(request)
+        if response.status_code not in (200, 201, 202):
+            return response
+
+        target_victims = getattr(state, "_byzantine_drop", [])
+        if not target_victims:
+            return response
+
+        try:
+            payload_json = json.loads(body_bytes)
+            tx_id = payload_json.get("tx_id", "")
+            sequence_num = payload_json.get("sequence_number", 0)
+            
+            asyncio.ensure_future(
+                _send_corrupted_broadcast(
+                    state, target_victims, request.url.path, tx_id, sequence_num
+                )
+            )
+        except Exception as err:
+            logger.warning("Byzantine corruption pipeline failure: %s", err)
+
+        return response
 
 
-async def _send_corrupted_broadcast(state, drop_peers, path, tx_id, seq):
+async def _send_corrupted_broadcast(state, targets, request_path, tx_id, sequence_num):
     from node_app.core.mesh import build_signed_message
 
-    if "/pre-prepare" in path:
-        phase = "PREPARE"
-    elif "/prepare" in path:
-        phase = "COMMIT"
+    if "/pre-prepare" in request_path:
+        consensus_phase = "PREPARE"
+    elif "/prepare" in request_path:
+        consensus_phase = "COMMIT"
     else:
         return
 
-    forged_tx_id = hashlib.sha256(f"byzantine_{tx_id}".encode()).hexdigest()
+    poisoned_tx_id = hashlib.sha256(f"byzantine_{tx_id}".encode()).hexdigest()
 
-    payload = build_signed_message(
+    forged_message = build_signed_message(
         state.private_key_hex,
-        forged_tx_id,
-        seq,
-        phase,
+        poisoned_tx_id,
+        sequence_num,
+        consensus_phase,
         state.node_id,
     )
 
-    endpoint = f"/{phase.lower()}"
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        tasks = [
-            client.post(f"http://{peer}:8000{endpoint}", json=payload)
-            for peer in drop_peers
+    endpoint_path = f"/{consensus_phase.lower()}"
+    async with httpx.AsyncClient(timeout=2.0) as http_client:
+        post_tasks = [
+            http_client.post(f"http://{peer}:8000{endpoint_path}", json=forged_message)
+            for peer in targets
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for peer, result in zip(drop_peers, results):
-            if isinstance(result, Exception):
-                logger.debug("Corrupt broadcast to %s failed: %s", peer, result)
+        network_outcomes = await asyncio.gather(*post_tasks, return_exceptions=True)
+        for peer, outcome in zip(targets, network_outcomes):
+            if isinstance(outcome, Exception):
+                logger.debug("Corrupt broadcast transmission to %s dropped: %s", peer, outcome)
